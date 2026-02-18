@@ -1,0 +1,134 @@
+name: Test And Prune Streams
+
+# Manual trigger only — do NOT add schedule here.
+# With 638k+ stream URLs, even a single uncapped run can eat hours of CI minutes.
+# Use --max-urls to run in safe batches and stitch results over multiple runs.
+on:
+  workflow_dispatch:
+    inputs:
+      max_urls:
+        description: "Max URLs to test this run (0 = all — dangerous at 638k+, use batches)"
+        required: false
+        default: "2000"
+      workers:
+        description: "Parallel workers"
+        required: false
+        default: "24"
+      timeout:
+        description: "Per-URL ffprobe timeout (seconds)"
+        required: false
+        default: "5"
+      retry_failed:
+        description: "Extra ffprobe retries on failure"
+        required: false
+        default: "0"
+      use_ffmpeg_fallback:
+        description: "Use ffmpeg fallback after ffprobe failure"
+        required: false
+        type: boolean
+        default: false
+      progress_every:
+        description: "Log progress every N URLs"
+        required: false
+        default: "100"
+      verbose:
+        description: "Log every individual URL result"
+        required: false
+        type: boolean
+        default: false
+      show_failures:
+        description: "Max failed URLs to print in summary"
+        required: false
+        default: "30"
+
+jobs:
+  stream-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    concurrency:
+      group: stream-test
+      cancel-in-progress: true
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ── ffmpeg cache ───────────────────────────────────────────────────────────
+    # Caches the ffmpeg/ffprobe binaries so apt-get only runs on a cold cache.
+    # Cache key is pinned to the OS; bump the suffix (v2, v3…) to force a refresh.
+    - name: Restore ffmpeg cache
+      id: cache-ffmpeg
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/ffmpeg-bin
+        key: ffmpeg-${{ runner.os }}-v1
+
+    - name: Install ffmpeg (cache miss only)
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ffmpeg
+        mkdir -p ~/.local/ffmpeg-bin
+        cp "$(command -v ffmpeg)"  ~/.local/ffmpeg-bin/
+        cp "$(command -v ffprobe)" ~/.local/ffmpeg-bin/
+
+    - name: Add ffmpeg to PATH
+      run: echo "$HOME/.local/ffmpeg-bin" >> "$GITHUB_PATH"
+
+    # ── Fetch channels.json from CDN ───────────────────────────────────────────
+    - name: Download channels.json
+      run: |
+        curl -fsSL "https://priv-bc7.pages.dev/aongewach/channels.json" \
+          -o channels.json
+        echo "Downloaded $(wc -c < channels.json) bytes"
+        python - <<'EOF'
+        import json, sys
+        with open("channels.json") as f:
+            d = json.load(f)
+        ch = d.get("channels", {})
+        stats = d.get("metadata", {}).get("stats", {})
+        print(f"Channels: {len(ch)}")
+        print(f"Streams (metadata): {stats.get('streams_total', 'n/a')}")
+        EOF
+
+    # ── Run the tester ─────────────────────────────────────────────────────────
+    - name: Prune dead streams
+      run: |
+        CMD=(python stream_tester.py channels.json
+          --workers       "${{ inputs.workers }}"
+          --timeout       "${{ inputs.timeout }}"
+          --retry-failed  "${{ inputs.retry_failed }}"
+          --progress-every "${{ inputs.progress_every }}"
+          --show-failures "${{ inputs.show_failures }}")
+
+        if [ "${{ inputs.max_urls }}" != "0" ]; then
+          CMD+=(--max-urls "${{ inputs.max_urls }}")
+        fi
+        if [ "${{ inputs.use_ffmpeg_fallback }}" != "true" ]; then
+          CMD+=(--no-ffmpeg-fallback)
+        fi
+        if [ "${{ inputs.verbose }}" = "true" ]; then
+          CMD+=(--verbose)
+        fi
+
+        printf 'Running: '
+        printf '%q ' "${CMD[@]}"
+        echo
+        "${CMD[@]}"
+
+    # ── Commit pruned channels.json back to the repo ───────────────────────────
+    - name: Commit pruned channels.json
+      run: |
+        git config user.name  "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add channels.json
+        if git diff --staged --quiet; then
+          echo "No changes — all tested URLs were alive."
+        else
+          TESTED="${{ inputs.max_urls }}"
+          [ "$TESTED" = "0" ] && TESTED="all"
+          git commit -m "chore: prune dead streams (tested ${TESTED} URLs) [skip ci]"
+          git push
+        fi
